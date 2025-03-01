@@ -1,44 +1,76 @@
 #!/bin/bash
 
-# Log file
+# Log everything
 LOGFILE="/var/log/bt-setup.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
 echo "Starting Bluetooth setup at $(date)"
 
-# Check if we've already updated today
-LAST_UPDATE_FILE="/var/log/last-apt-update"
-TODAY=$(date +%Y-%m-%d)
+# Install required packages
+apt-get update
+apt-get install -y bluetooth bluez bluez-tools python3-dbus python3-gi rfkill
 
-if [ -f "$LAST_UPDATE_FILE" ] && [ "$(cat $LAST_UPDATE_FILE)" = "$TODAY" ]; then
-    echo "Already updated packages today, skipping update"
+# Completely stop and reset Bluetooth
+echo "Resetting Bluetooth stack..."
+systemctl stop bluetooth
+modprobe -r btusb
+modprobe -r bluetooth
+sleep 2
+modprobe bluetooth
+modprobe btusb
+sleep 2
+
+# Ensure firmware is loaded
+echo "Loading Bluetooth firmware..."
+if [ -f /lib/firmware/brcm/BCM43430A1.hcd ]; then
+    echo "Raspberry Pi 3/Zero W firmware found"
+elif [ -f /lib/firmware/brcm/BCM4345C0.hcd ]; then
+    echo "Raspberry Pi 3B+/4 firmware found"
 else
-    echo "Updating package lists..."
-    apt-get update
-    # Save today's date to the file
-    echo "$TODAY" > "$LAST_UPDATE_FILE"
-    echo "Package lists updated and timestamp recorded"
+    echo "WARNING: Could not find Bluetooth firmware files"
 fi
 
-# Install required packages only if not already installed
-echo "Checking and installing required Bluetooth packages if needed..."
-for pkg in bluetooth bluez bluez-tools python3-dbus python3-gi; do
-    if ! dpkg -l | grep -q " $pkg "; then
-        echo "Installing $pkg..."
-        apt-get install -y $pkg
-    else
-        echo "$pkg is already installed"
+# Restart Bluetooth with clean config
+echo "Starting Bluetooth service..."
+systemctl start bluetooth
+sleep 5
+
+# Confirm Bluetooth is working
+echo "Checking Bluetooth status:"
+if ! hciconfig -a | grep -q "hci0"; then
+    echo "ERROR: No Bluetooth adapter found! Trying to fix..."
+    # Try to reset the Bluetooth hardware
+    rfkill unblock bluetooth
+    sleep 2
+    
+    # Check if we have an adapter now
+    if ! hciconfig -a | grep -q "hci0"; then
+        echo "CRITICAL: Still no Bluetooth adapter found. Script cannot continue."
+        exit 1
     fi
-done
+fi
 
-# Stop any services using the serial port
-systemctl disable serial-getty@ttyAMA0.service 2>/dev/null
-systemctl disable serial-getty@ttyS0.service 2>/dev/null
+# Show detected Bluetooth adapter
+hciconfig -a
 
-# Reset Bluetooth to clean state
-echo "Resetting Bluetooth..."
-rfkill block bluetooth
-rfkill unblock bluetooth
+# Remove existing audio profiles by modifying main.conf
+echo "Disabling audio profiles..."
+cat > /etc/bluetooth/main.conf << 'EOF'
+[General]
+Name = KaliPi-BT
+Class = 0x000100
+DiscoverableTimeout = 0
+PairableTimeout = 0
+AutoConnectTimeout = 60000
+
+[Policy]
+AutoEnable=true
+
+# Disable audio profiles
+Disable=audio,media,a2dp,avrcp
+EOF
+
+# Restart Bluetooth again with new configuration
 systemctl restart bluetooth
 sleep 3
 
@@ -114,8 +146,100 @@ if __name__ == '__main__':
 EOF
 chmod +x /usr/local/bin/bt-pin-agent.py
 
-# Create PIN agent service
-echo "Creating PIN agent service..."
+# Create the serial handler script
+echo "Creating serial handler script..."
+cat > /usr/local/bin/bt-serial.sh << 'EOF'
+#!/bin/bash
+
+# Log file
+LOGFILE="/var/log/bt-serial.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+echo "Starting Bluetooth serial service at $(date)"
+
+# Make sure device exists
+if ! hciconfig -a | grep -q "hci0"; then
+    echo "ERROR: No Bluetooth adapter found"
+    systemctl restart bluetooth
+    sleep 3
+    
+    if ! hciconfig -a | grep -q "hci0"; then
+        echo "CRITICAL: Still no Bluetooth adapter. Exiting."
+        exit 1
+    fi
+fi
+
+# Configure Bluetooth adapter
+echo "Configuring Bluetooth adapter..."
+hciconfig hci0 up
+hciconfig hci0 reset
+sleep 1
+
+# Set class to Serial Port device only (0x000100)
+hciconfig hci0 class 0x000100
+hciconfig hci0 name KaliPi-BT
+hciconfig hci0 piscan
+
+# Disable SSP for classic PIN code
+echo "Disabling Simple Secure Pairing..."
+btmgmt ssp off
+
+# Make sure there are no stale RFCOMM sessions
+echo "Cleaning up any existing RFCOMM sessions..."
+killall rfcomm 2>/dev/null
+sleep 1
+
+# Remove existing services
+echo "Removing any existing service profiles..."
+for i in $(sdptool browse local | grep "Service RecHandle" | awk '{print $3}'); do
+    sdptool del $i
+done
+
+# Register only the Serial Port Profile
+echo "Registering Serial Port Profile..."
+sdptool add --channel=1 SP
+
+# Start RFCOMM in watch mode
+echo "Starting RFCOMM watch on channel 1..."
+rfcomm watch hci0 1 /bin/bash -c "cat /dev/rfcomm0 | /bin/bash 2>&1 | cat > /dev/rfcomm0" &
+RFCOMM_PID=$!
+
+# Keep the service running
+while true; do
+    echo "=== Status check at $(date) ==="
+    
+    # Verify adapter is up
+    if ! hciconfig -a | grep -q "UP RUNNING"; then
+        echo "Adapter down, bringing it up..."
+        hciconfig hci0 up
+        hciconfig hci0 class 0x000100
+        hciconfig hci0 piscan
+    fi
+    
+    # Check if RFCOMM process is running
+    if ! ps -p $RFCOMM_PID > /dev/null; then
+        echo "RFCOMM process died, restarting..."
+        rfcomm watch hci0 1 /bin/bash -c "cat /dev/rfcomm0 | /bin/bash 2>&1 | cat > /dev/rfcomm0" &
+        RFCOMM_PID=$!
+    fi
+    
+    # Display current status
+    echo "Current adapter status:"
+    hciconfig -a
+    
+    echo "Current services:"
+    sdptool browse local
+    
+    echo "RFCOMM status:"
+    rfcomm
+    
+    sleep 60
+done
+EOF
+chmod +x /usr/local/bin/bt-serial.sh
+
+# Create services
+echo "Creating systemd services..."
 cat > /etc/systemd/system/bt-pin-agent.service << 'EOF'
 [Unit]
 Description=Bluetooth PIN Agent
@@ -131,8 +255,6 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# Create the serial service
-echo "Creating serial service..."
 cat > /etc/systemd/system/bt-serial.service << 'EOF'
 [Unit]
 Description=Bluetooth Serial Service
@@ -144,115 +266,94 @@ Type=simple
 User=root
 ExecStart=/usr/local/bin/bt-serial.sh
 Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Create the serial handler script with automatic connection to first paired device
-cat > /usr/local/bin/bt-serial.sh << 'EOF'
+# Create control script
+echo "Creating control script..."
+cat > /usr/local/bin/bt-control << 'EOF'
 #!/bin/bash
 
-# Log file
-LOGFILE="/var/log/bt-serial.log"
-exec > >(tee -a "$LOGFILE") 2>&1
-
-echo "Starting Bluetooth serial service at $(date)"
-
-# Configure Bluetooth
-echo "Configuring Bluetooth adapter..."
-hciconfig hci0 up
-hciconfig hci0 piscan
-hciconfig hci0 name KaliPi-BT
-
-# Disable SSP (Simple Secure Pairing) to use legacy PIN code pairing
-btmgmt ssp off
-
-# Set up SPP profile
-echo "Setting up Serial Port Profile..."
-sdptool add SP
-
-# Monitor for the first device to pair and connect to it
-echo "Waiting for first device to pair..."
-
-# Function to get paired but not connected devices
-get_first_paired_device() {
-    bluetoothctl paired-devices | head -n 1 | cut -d ' ' -f 2
-}
-
-# Wait until we have at least one paired device
-while true; do
-    DEVICE=$(get_first_paired_device)
-    if [ -n "$DEVICE" ]; then
-        echo "Found paired device: $DEVICE"
-        break
-    fi
-    echo "No paired devices found yet, waiting..."
-    sleep 5
-done
-
-# Trust and connect to the first paired device
-echo "Trusting and connecting to device: $DEVICE"
-bluetoothctl trust "$DEVICE"
-
-# Establish RFCOMM connection in client mode
-echo "Establishing RFCOMM connection to $DEVICE..."
-rfcomm connect hci0 "$DEVICE" 1 &
-RFCOMM_PID=$!
-
-# Give RFCOMM time to establish
-sleep 3
-
-# Check if connection was successful
-if ps -p $RFCOMM_PID > /dev/null; then
-    echo "RFCOMM connection established successfully"
-    echo "Connecting serial port to shell..."
-    # Set up shell access through the connection
-    cat /dev/rfcomm0 | /bin/bash 2>&1 | cat > /dev/rfcomm0 &
-    SHELL_PID=$!
-else
-    echo "Failed to establish RFCOMM connection, falling back to watch mode"
-    rfcomm watch hci0 1 /bin/bash -c "cat /dev/rfcomm0 | /bin/bash 2>&1 | cat > /dev/rfcomm0" &
+# Display usage if no parameters given
+if [ -z "$1" ]; then
+    echo "Usage: bt-control [start|stop|restart|status|enable|disable]"
+    exit 1
 fi
 
-# Keep the service running and log active connections
-while true; do
-    echo "=== Status check at $(date) ==="
-    hciconfig -a
-    echo "RFCOMM connections:"
-    rfcomm
-    
-    # Check if our connection is still alive
-    if [ -n "$RFCOMM_PID" ] && ! ps -p $RFCOMM_PID > /dev/null; then
-        echo "RFCOMM connection lost, reconnecting..."
-        rfcomm connect hci0 "$DEVICE" 1 &
-        RFCOMM_PID=$!
+case "$1" in
+    start)
+        echo "Starting Bluetooth serial services..."
+        systemctl start bt-pin-agent.service
+        systemctl start bt-serial.service
+        ;;
+    stop)
+        echo "Stopping Bluetooth serial services..."
+        systemctl stop bt-serial.service
+        systemctl stop bt-pin-agent.service
+        ;;
+    restart)
+        echo "Restarting Bluetooth stack and services..."
+        systemctl stop bt-serial.service
+        systemctl stop bt-pin-agent.service
+        systemctl stop bluetooth
+        sleep 2
+        systemctl start bluetooth
         sleep 3
-        
-        # Restart shell if connection was re-established
-        if ps -p $RFCOMM_PID > /dev/null; then
-            if [ -n "$SHELL_PID" ] && ps -p $SHELL_PID > /dev/null; then
-                kill $SHELL_PID
-            fi
-            cat /dev/rfcomm0 | /bin/bash 2>&1 | cat > /dev/rfcomm0 &
-            SHELL_PID=$!
-        fi
-    fi
-    
-    sleep 60
-done
-EOF
-chmod +x /usr/local/bin/bt-serial.sh
+        systemctl start bt-pin-agent.service
+        systemctl start bt-serial.service
+        ;;
+    status)
+        echo "=== Bluetooth Service Status ==="
+        systemctl status bluetooth
+        echo "=== PIN Agent Status ==="
+        systemctl status bt-pin-agent.service
+        echo "=== Serial Service Status ==="
+        systemctl status bt-serial.service
+        echo "=== RFCOMM Connections ==="
+        rfcomm
+        echo "=== Bluetooth Adapter Status ==="
+        hciconfig -a
+        echo "=== Bluetooth Services ==="
+        sdptool browse local
+        ;;
+    enable)
+        echo "Enabling Bluetooth serial services to start at boot..."
+        systemctl enable bt-pin-agent.service
+        systemctl enable bt-serial.service
+        ;;
+    disable)
+        echo "Disabling Bluetooth serial services at boot..."
+        systemctl disable bt-serial.service
+        systemctl disable bt-pin-agent.service
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Usage: bt-control [start|stop|restart|status|enable|disable]"
+        exit 1
+        ;;
+esac
 
-# Enable and start services
-echo "Enabling and starting services..."
+exit 0
+EOF
+chmod +x /usr/local/bin/bt-control
+
+# Enable services
+echo "Enabling services to start at boot..."
 systemctl daemon-reload
 systemctl enable bt-pin-agent.service
-systemctl start bt-pin-agent.service
 systemctl enable bt-serial.service
+
+# Start services
+echo "Starting services..."
+systemctl start bt-pin-agent.service
 systemctl start bt-serial.service
 
 echo "Setup complete at $(date)"
 echo "PIN code is set to: 5471"
 echo "Your device should appear as 'KaliPi-BT'"
-echo "Please check logs at /var/log/bt-setup.log and /var/log/bt-serial.log for details"
+echo "Use '/usr/local/bin/bt-control [start|stop|restart|status|enable|disable]' to control the service"
+echo "You MUST reboot for all changes to take full effect"
+echo "Please run: sudo reboot"
