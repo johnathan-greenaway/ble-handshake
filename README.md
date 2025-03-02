@@ -1,2 +1,2 @@
-# kali-ble
-Initializes Kali Linux for bluetooth serial terminal interactions on Pi Zero 2W
+# ble  handshake
+Initializes bluetooth serial terminal on Pi Zero 2W for headless configuration.
